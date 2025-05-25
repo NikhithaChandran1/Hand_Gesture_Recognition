@@ -2,25 +2,30 @@ import cv2
 import mediapipe as mp
 import pyautogui
 import time
+import numpy as np
+from collections import deque
 
-# Initialize mediapipe Hands
+# Setup Mediapipe
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.75,
+    min_tracking_confidence=0.75
+)
 mp_draw = mp.solutions.drawing_utils
 
-# Finger tip landmarks indices
+# Tip landmark IDs
 tipIds = [4, 8, 12, 16, 20]
 
 def fingers_up(hand_landmarks):
     fingers = []
-
     # Thumb
     if hand_landmarks.landmark[tipIds[0]].x < hand_landmarks.landmark[tipIds[0] - 1].x:
         fingers.append(1)
     else:
         fingers.append(0)
-
-    # Fingers
+    # Other fingers
     for id in range(1, 5):
         if hand_landmarks.landmark[tipIds[id]].y < hand_landmarks.landmark[tipIds[id] - 2].y:
             fingers.append(1)
@@ -28,75 +33,96 @@ def fingers_up(hand_landmarks):
             fingers.append(0)
     return fingers
 
-# Open webcam
+# Video capture
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)   # Lower resolution for better speed
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(3, 640)
+cap.set(4, 480)
 
-pTime = 0
-
-# Cooldown for gestures (in seconds)
-cooldown = 0.3
-last_gesture_time = 0
+position_buffer = deque(maxlen=4)
+last_action_time = 0
+cooldown = 0.25  # seconds
+movement_threshold = 35
+action_text = ""
 
 while True:
-    ret, frame = cap.read()
-    if not ret:
+    success, frame = cap.read()
+    if not success:
         break
 
-    # Flip frame to act as a mirror
     frame = cv2.flip(frame, 1)
-    h, w, c = frame.shape
-
-    # Convert to RGB
+    h, w, _ = frame.shape
     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     result = hands.process(img_rgb)
-
     current_time = time.time()
+    hand_present = False
+    detected_action = ""
 
     if result.multi_hand_landmarks:
         for hand_landmarks in result.multi_hand_landmarks:
+            hand_present = True
             mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
             fingers = fingers_up(hand_landmarks)
 
-            # Gesture logic with cooldown
-            if fingers == [0, 1, 0, 0, 0]:  # Swipe right
-                if current_time - last_gesture_time > cooldown:
-                    pyautogui.press('right')
-                    last_gesture_time = current_time
-                cv2.putText(frame, 'Swipe Right', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 3)
+            # Get center position of the hand
+            cx = int(hand_landmarks.landmark[9].x * w)
+            cy = int(hand_landmarks.landmark[9].y * h)
+            position_buffer.append((cx, cy))
 
-            elif fingers == [0, 1, 1, 0, 0]:  # Swipe left
-                if current_time - last_gesture_time > cooldown:
-                    pyautogui.press('left')
-                    last_gesture_time = current_time
-                cv2.putText(frame, 'Swipe Left', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 3)
+            # Movement detection when all fingers are up
+            if fingers == [1, 1, 1, 1, 1] and len(position_buffer) >= 2:
+                dx = position_buffer[-1][0] - position_buffer[0][0]
+                dy = position_buffer[-1][1] - position_buffer[0][1]
 
-            elif fingers == [1, 1, 1, 1, 1]:  # Jump
-                if current_time - last_gesture_time > cooldown:
-                    pyautogui.press('up')
-                    last_gesture_time = current_time
-                cv2.putText(frame, 'Jump', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 3)
+                if abs(dx) > abs(dy):
+                    if dx > movement_threshold:
+                        detected_action = "Move Right"
+                    elif dx < -movement_threshold:
+                        detected_action = "Move Left"
+                else:
+                    if dy < -movement_threshold:
+                        detected_action = "Jump"
+                    elif dy > movement_threshold:
+                        detected_action = "Slide"
 
-            elif fingers == [0, 0, 0, 0, 0]:  # Roll (hoverboard)
-                if current_time - last_gesture_time > cooldown:
-                    pyautogui.press('down')
-                    last_gesture_time = current_time
-                cv2.putText(frame, 'Roll (Hoverboard)', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 3)
+            # All fingers closed → Hoverboard
+            elif fingers == [0, 0, 0, 0, 0]:
+                detected_action = "Hoverboard"
 
-    # Calculate and display FPS
-    cTime = time.time()
-    fps = 1 / (cTime - pTime) if (cTime - pTime)!=0 else 0
-    pTime = cTime
-    cv2.putText(frame, f'FPS: {int(fps)}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+    # Trigger action immediately (no delay)
+    if detected_action and (current_time - last_action_time > cooldown):
+        if detected_action == "Move Right":
+            pyautogui.press("right")
+        elif detected_action == "Move Left":
+            pyautogui.press("left")
+        elif detected_action == "Jump":
+            pyautogui.press("up")
+        elif detected_action == "Slide":
+            pyautogui.press("down")
+        elif detected_action == "Hoverboard":
+            pyautogui.press("space")
+        action_text = detected_action
+        last_action_time = current_time
 
-    cv2.imshow("Subway Surfers Gesture Control", frame)
+    # Display current action
+    if action_text:
+        cv2.putText(frame, f'Action: {action_text}', (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
 
-    if cv2.waitKey(1) & 0xFF == 27:  # Press ESC to exit
+    # FPS
+    fps = int(1 / max((time.time() - current_time), 1e-5))
+    cv2.putText(frame, f'FPS: {fps}', (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+
+    if not hand_present:
+        position_buffer.clear()
+        action_text = ""
+
+    cv2.imshow("Subway Surfers Controller", frame)
+
+    if cv2.waitKey(1) & 0xFF == 27:
         break
 
 cap.release()
 cv2.destroyAllWindows()
 
- 
